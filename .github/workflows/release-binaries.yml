@@ -7,23 +7,6 @@ on:
         description: Publish the binaries as a GitHub release
         type: boolean
         default: true
-  push:
-    branches:
-      - nx2-experimental
-    # A binary only changes when build inputs change; docs-only pushes skip the build.
-    paths:
-      - "src/**"
-      # Test-only changes cannot change a binary: the build configures with BUILD_TESTING=OFF and
-      # YUZU_TESTS=OFF below, so a push that only touches src/tests has nothing to rebuild.
-      - "!src/tests/**"
-      - "CMakeLists.txt"
-      - "CMakeModules/**"
-      - "externals/**"
-      - "dist/**"
-      - "tools/**"
-      - ".patch/**"
-      - "cpmfile.json"
-      - ".github/workflows/release-binaries.yml"
 
 permissions:
   contents: read
@@ -34,8 +17,7 @@ permissions:
 env:
   PGO_LLVM_VERSION: "23"
 
-# A running build is never cancelled: it finishes and publishes. A push meanwhile queues one build;
-# a later push replaces it, so the newest commit builds as soon as the running one is done.
+# A running build is never cancelled: it finishes and publishes. Manual runs queue independently.
 concurrency:
   group: release-binaries-${{ github.ref }}
   cancel-in-progress: false
@@ -48,7 +30,7 @@ jobs:
       contents: write
     steps:
       - name: Prepare release tag
-        if: github.event_name == 'push' || inputs.publish_release
+        if: inputs.publish_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -619,13 +601,12 @@ jobs:
           compression-level: 0
           retention-days: 7
 
-  # Publishes every binary as a GitHub pre-release once every platform built: on pushes to
-  # nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
-  # unticked.
+  # Publishes every binary as a GitHub pre-release once every platform built when the manual
+  # "Publish the binaries as a GitHub release" input is checked.
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    if: inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
