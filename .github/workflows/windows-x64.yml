@@ -1,0 +1,210 @@
+name: windows-x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prepare-release:
+    name: Prepare Windows x64 release tag
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Prepare release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="windows-x64-${GITHUB_RUN_NUMBER}"
+          if tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha' 2>/dev/null); then
+            if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
+              exit 1
+            fi
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/$tag" -f "sha=$GITHUB_SHA"
+          fi
+
+  build:
+    name: Windows x64 MSVC binary
+    needs: prepare-release
+    runs-on: windows-2022
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_CACHE_SIZE: 3G
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt on Windows
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts
+          cache: true
+
+      # MSVC is not something ccache handles well, so use sccache for this build.
+      - name: Install sccache on Windows
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'sccache.zip'
+          Invoke-WebRequest -OutFile $zip https://github.com/mozilla/sccache/releases/download/v0.19.0/sccache-v0.19.0-x86_64-pc-windows-msvc.zip
+          Expand-Archive $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'sccache')
+          $bin = (Get-ChildItem -Recurse -Filter sccache.exe (Join-Path $env:RUNNER_TEMP 'sccache')).DirectoryName
+          $bin | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Install Vulkan SDK on Windows
+        shell: pwsh
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Verify Vulkan tools on Windows
+        shell: pwsh
+        run: glslangValidator --version
+
+      - name: Restore CPM downloads
+        id: cpm-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/cpm
+          key: cpm-windows-x86_64-v2-${{ hashFiles('cpmfile.json', 'CMakeLists.txt', 'CMakeModules/CPM*.cmake', 'externals/**/CMakeLists.txt', 'src/**/CMakeLists.txt') }}
+          restore-keys: |
+            cpm-windows-x86_64-v2-
+            cpm-${{ runner.os }}-
+
+      - name: Restore compiler objects
+        id: compiler-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: .sccache
+          key: objects-windows-x86_64-v2-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            objects-windows-x86_64-v2-${{ github.sha }}-
+            objects-windows-x86_64-v2-
+
+      - name: Save CPM downloads
+        if: steps.cpm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/cpm
+          key: ${{ steps.cpm-cache.outputs.cache-primary-key }}
+
+      - name: Configure Windows
+        shell: bash
+        run: >-
+          cmake -S . -B build/release -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=OFF
+          -DYUZU_TESTS=OFF
+          -DYUZU_CMD=ON
+          -DYUZU_ROOM=OFF
+          -DYUZU_ROOM_STANDALONE=OFF
+          -DYUZU_USE_BUNDLED_QT=OFF
+          -DYUZU_USE_BUNDLED_SDL3=ON
+          -DENABLE_UPDATE_CHECKER=ON
+          -DLICHII_BUILD_TAG=build-${{ github.run_number }}
+          -DLICHII_BUILD_PLATFORM=windows-x86_64
+          -DUSE_DISCORD_PRESENCE=OFF
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build
+        shell: bash
+        run: |
+          sccache --zero-stats
+          cmake --build build/release --target yuzu yuzu-cmd --parallel
+          sccache --show-stats
+
+      - name: Stop sccache on Windows
+        if: always() && steps.compiler-cache.outcome == 'success'
+        shell: pwsh
+        run: sccache --stop-server
+
+      - name: Save compiler objects
+        if: always() && steps.compiler-cache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: .sccache
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+
+      - name: Package Windows binary
+        shell: pwsh
+        run: |
+          foreach ($exe in 'lichii.exe', 'eden-cli.exe') {
+            if (-not (Test-Path "build/release/bin/$exe")) {
+              throw "build/release/bin/$exe was not produced"
+            }
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+
+      # Upload the bin folder so downloading the artifact produces one usable package.
+      - name: Upload Windows binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: lichii-windows-x86_64-${{ github.sha }}
+          path: build/release/bin/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish Windows x64 release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows binary
+        uses: actions/download-artifact@v7
+        with:
+          name: lichii-windows-x86_64-${{ github.sha }}
+          path: artifacts
+
+      - name: Package release file
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir dist
+          test -f artifacts/lichii.exe
+          test -f artifacts/eden-cli.exe
+          (cd artifacts && zip -qr "${GITHUB_WORKSPACE}/dist/lichii-windows-x86_64.zip" .)
+          ls -la dist
+
+      - name: Create GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="windows-x64-${GITHUB_RUN_NUMBER}"
+          tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$tag" --jq '.object.sha')
+          if [ "$tag_sha" != "$GITHUB_SHA" ]; then
+            echo "Release tag $tag points to $tag_sha instead of $GITHUB_SHA"
+            exit 1
+          fi
+
+          cat > notes.md <<EOF
+          Windows x64 MSVC build of \`${GITHUB_REF_NAME}\` at ${GITHUB_SHA}.
+
+          Extract \`lichii-windows-x86_64.zip\` and run \`lichii.exe\`, or \`eden-cli.exe\` from a terminal.
+          EOF
+
+          gh release create "$tag" dist/lichii-windows-x86_64.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --prerelease \
+            --title "Lichii Windows x64 build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
+            --notes-file notes.md
